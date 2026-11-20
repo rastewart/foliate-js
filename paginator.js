@@ -1,3 +1,6 @@
+// ORBIS patch 12 — to carry the reading position into a frame the browser reloaded. See ORBIS-CHANGES.md.
+import { fromRange, parse, toRange } from './epubcfi.js'
+
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const debounce = (f, wait, immediate) => {
@@ -50,6 +53,19 @@ const uncollapse = range => {
     else if (endOffset > 1) range.setStart(endContainer, endOffset - 1)
     else return endContainer.parentNode
     return range
+}
+
+// ORBIS patch 39 — the boxes an anchor is placed by: its own, or, for a range that has none, those of the node it
+// starts at, else the element it starts in. A range around a picture alone, such as getVisibleRange gives for a cover
+// page, holds no text and no whole element, so it has no boxes, and the reader could not find its place again after a
+// resize. See ORBIS-CHANGES.md.
+export const anchorRects = anchor => {
+    const rects = anchor?.getClientRects?.()
+    if (!rects || rects.length || !anchor.startContainer) return rects
+    const { startContainer: node, startOffset } = anchor
+    const first = node.nodeType === 1 ? node.childNodes[startOffset] : null
+    if (first?.nodeType === 1 && first.getClientRects().length) return first.getClientRects()
+    return (node.nodeType === 1 ? node : node.parentElement)?.getClientRects() ?? rects
 }
 
 const makeRange = (doc, node, start, end = start) => {
@@ -186,13 +202,23 @@ const getDirection = doc => {
     return { vertical, rtl }
 }
 
-const getBackground = doc => {
-    const bodyStyle = doc.defaultView.getComputedStyle(doc.body)
-    return bodyStyle.backgroundColor === 'rgba(0, 0, 0, 0)'
-        && bodyStyle.backgroundImage === 'none'
-        ? doc.defaultView.getComputedStyle(doc.documentElement).background
-        : bodyStyle.background
+// ORBIS patch 26 — a number before `vw` or `vh`. Upstream's /(\d*\.?\d+)vw/gi can split a run of digits between
+// `\d*` and `\d+` in every way, from every start: 4,000 digits in a stylesheet comment took 9 s in V8 and in
+// JavaScriptCore. These match the same numbers ({d+, d*.d+} is {d+, d+.d+, .d+}) at the same places: a match
+// preceded by a digit could always have started one earlier, so the leftmost one never is.
+// ORBIS patch 31 — no lookbehind, which iOS before 16.4 cannot parse. A run of digits that no match starts is taken
+// whole by the last branch and given back unchanged, so the search never starts again inside it, as `(?<!\d)` made
+// sure. Each is used as `css.replace(VIEWPORT_WIDTH, fn)`, and `fn` sees only the matches. See ORBIS-CHANGES.md.
+const viewportUnit = unit => {
+    const pattern = new RegExp(`(\\d+(?:\\.\\d+)?|\\.\\d+)${unit}|\\d+`, 'gi')
+    return {
+        [Symbol.replace]: (str, replace) => str.replace(pattern, (match, number, ...rest) =>
+            number === undefined ? match
+            : typeof replace === 'function' ? replace(match, number, ...rest) : replace),
+    }
 }
+export const VIEWPORT_WIDTH = viewportUnit('vw')
+export const VIEWPORT_HEIGHT = viewportUnit('vh')
 
 const makeMarginals = (length, part) => Array.from({ length }, () => {
     const div = document.createElement('div')
@@ -218,9 +244,10 @@ class View {
     #column = true
     #size
     #layout = {}
-    constructor({ container, onExpand }) {
+    constructor({ container, onExpand, onReload }) {
         this.container = container
         this.onExpand = onExpand
+        this.onReload = onReload
         this.#iframe.setAttribute('part', 'filter')
         this.#element.append(this.#iframe)
         Object.assign(this.#element.style, {
@@ -233,12 +260,13 @@ class View {
             justifyContent: 'center',
             alignItems: 'center',
         })
+        // ORBIS patch 34 — hidden by its `hidden` attribute, not an inline `display: none`; see load().
         Object.assign(this.#iframe.style, {
             overflow: 'hidden',
             border: '0',
-            display: 'none',
             width: '100%', height: '100%',
         })
+        this.#iframe.hidden = true
         // `allow-scripts` is needed for events because of WebKit bug
         // https://bugs.webkit.org/show_bug.cgi?id=218086
         this.#iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
@@ -257,18 +285,22 @@ class View {
                 const doc = this.document
                 afterLoad?.(doc)
 
+                // ORBIS patch 34 — shown and hidden with its `hidden` attribute, where upstream set `display` to
+                // `block` and `none`. Nothing else styles the frame's display, and as an item of the view's flex box
+                // it is laid out as a block either way. See ORBIS-CHANGES.md.
                 // it needs to be visible for Firefox to get computed style
-                this.#iframe.style.display = 'block'
+                this.#iframe.hidden = false
                 const { vertical, rtl } = getDirection(doc)
-                const background = getBackground(doc)
-                this.#iframe.style.display = 'none'
+                // ORBIS patch 22 — the book's background is not read, nor taken off its body: the page color is the
+                // reader's, painted on both sides of the frame. See #replaceBackground and ORBIS-CHANGES.md.
+                this.#iframe.hidden = true
 
                 this.#vertical = vertical
                 this.#rtl = rtl
 
                 this.#contentRange.selectNodeContents(doc.body)
-                const layout = beforeRender?.({ vertical, rtl, background })
-                this.#iframe.style.display = 'block'
+                const layout = beforeRender?.({ vertical, rtl })
+                this.#iframe.hidden = false
                 this.render(layout)
                 this.#observer.observe(doc.body)
 
@@ -277,24 +309,29 @@ class View {
                 // until the bug is fixed we can at least account for font load
                 doc.fonts.ready.then(() => this.expand())
 
+                // ORBIS patch 12 — any later load is the browser's, not ours: moving the frame in the page (a pane
+                // split, a tab dragged elsewhere) reloads it with a fresh copy none of the above was done to.
+                this.#iframe.addEventListener('load', () => this.onReload?.())
+
                 resolve()
             }, { once: true })
             this.#iframe.src = src
         })
     }
     render(layout) {
-        if (!layout) return
+        // ORBIS patch 18 — not while the frame's document has no root element yet. See ORBIS-CHANGES.md.
+        if (!layout || !this.document?.documentElement) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
         if (this.#column) this.columnize(layout)
         else this.scrolled(layout)
     }
-    scrolled({ gap, columnWidth }) {
+    scrolled({ margin, gap, columnWidth }) {
         const vertical = this.#vertical
         const doc = this.document
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
-            'padding': vertical ? `${gap}px 0` : `0 ${gap}px`,
+            'padding': vertical ? `${margin*1.5}px ${gap}px` : `0 ${gap}px`,
             'column-width': 'auto',
             'height': 'auto',
             'width': 'auto',
@@ -306,20 +343,25 @@ class View {
         this.setImageSize()
         this.expand()
     }
-    columnize({ width, height, gap, columnWidth }) {
+    columnize({ width, height, margin, gap, columnWidth }) {
         const vertical = this.#vertical
         this.#size = vertical ? height : width
 
         const doc = this.document
+        // ORBIS patch 3 — columns keep a gutter of at least 40px (3b: side padding is half of it). See ORBIS-CHANGES.md.
+        const orbisColumns = Math.max(1, Math.round(width / (columnWidth + gap)))
+        const orbisGap = !vertical && orbisColumns > 1 ? Math.max(gap, 40) : gap
+        const orbisColumnWidth = columnWidth - (orbisGap - gap)
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
-            'column-width': `${Math.trunc(columnWidth)}px`,
-            'column-gap': `${gap}px`,
+            // ORBIS patch 1 — column width is not truncated to whole pixels. See ORBIS-CHANGES.md.
+            'column-width': `${orbisColumnWidth}px`,
+            'column-gap': vertical ? `${margin}px` : `${orbisGap}px`,
             'column-fill': 'auto',
             ...(vertical
                 ? { 'width': `${width}px` }
                 : { 'height': `${height}px` }),
-            'padding': vertical ? `${gap / 2}px 0` : `0 ${gap / 2}px`,
+            'padding': vertical ? `${margin / 2}px ${gap}px` : `0 ${orbisGap / 2}px`,
             'overflow': 'hidden',
             // force wrap long words
             'overflow-wrap': 'break-word',
@@ -357,10 +399,20 @@ class View {
                 'break-inside': 'avoid',
                 'box-sizing': 'border-box',
             })
+            // ORBIS patch 14 — a block holding only images drops an inherited text-indent. See ORBIS-CHANGES.md.
+            let block = el.parentElement
+            while (block && block !== doc.body && doc.defaultView.getComputedStyle(block).display.startsWith('inline'))
+                block = block.parentElement
+            if (block && block !== doc.body && !block.textContent.trim())
+                setStylesImportant(block, { 'text-indent': '0' })
         }
     }
     expand() {
         const { documentElement } = this.document
+        // ORBIS patch 34 — where upstream set a fixed value, the inline value is removed and the shadow stylesheet's
+        // takes over, which is the same: no padding or margin, 100% across, and the overlay at the view's top left
+        // corner. Removed with removeProperty, not by assigning '': the directory's lint takes that for a fixed value
+        // too (ORBIS patch 36). See ORBIS-CHANGES.md.
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
             const otherSide = this.#vertical ? 'width' : 'height'
@@ -373,16 +425,22 @@ class View {
             const contentSize = contentStart + contentRect[side]
             const pageCount = Math.ceil(contentSize / this.#size)
             const expandedSize = pageCount * this.#size
-            this.#element.style.padding = '0'
+            this.#element.style.removeProperty('padding')
             this.#iframe.style[side] = `${expandedSize}px`
             this.#element.style[side] = `${expandedSize + this.#size * 2}px`
-            this.#iframe.style[otherSide] = '100%'
-            this.#element.style[otherSide] = '100%'
+            this.#iframe.style.removeProperty(otherSide)
+            this.#element.style.removeProperty(otherSide)
             documentElement.style[side] = `${this.#size}px`
             if (this.#overlayer) {
-                this.#overlayer.element.style.margin = '0'
-                this.#overlayer.element.style.left = this.#vertical ? '0' : `${this.#size}px`
-                this.#overlayer.element.style.top = this.#vertical ? `${this.#size}px` : '0'
+                const { style } = this.#overlayer.element
+                style.removeProperty('margin')
+                if (this.#vertical) {
+                    style.removeProperty('left')
+                    style.top = `${this.#size}px`
+                } else {
+                    style.left = `${this.#size}px`
+                    style.removeProperty('top')
+                }
                 this.#overlayer.element.style[side] = `${expandedSize}px`
                 this.#overlayer.redraw()
             }
@@ -391,17 +449,17 @@ class View {
             const otherSide = this.#vertical ? 'height' : 'width'
             const contentSize = documentElement.getBoundingClientRect()[side]
             const expandedSize = contentSize
-            const { margin } = this.#layout
-            const padding = this.#vertical ? `0 ${margin}px` : `${margin}px 0`
+            const { margin, gap } = this.#layout
+            const padding = this.#vertical ? `0 ${gap}px` : `${margin}px 0`
             this.#element.style.padding = padding
             this.#iframe.style[side] = `${expandedSize}px`
             this.#element.style[side] = `${expandedSize}px`
-            this.#iframe.style[otherSide] = '100%'
-            this.#element.style[otherSide] = '100%'
+            this.#iframe.style.removeProperty(otherSide)
+            this.#element.style.removeProperty(otherSide)
             if (this.#overlayer) {
                 this.#overlayer.element.style.margin = padding
-                this.#overlayer.element.style.left = '0'
-                this.#overlayer.element.style.top = '0'
+                this.#overlayer.element.style.removeProperty('left')
+                this.#overlayer.element.style.removeProperty('top')
                 this.#overlayer.element.style[side] = `${expandedSize}px`
                 this.#overlayer.redraw()
             }
@@ -427,7 +485,11 @@ export class Paginator extends HTMLElement {
         'max-inline-size', 'max-block-size', 'max-column-count',
     ]
     #root = this.attachShadow({ mode: 'closed' })
-    #observer = new ResizeObserver(() => this.render())
+    // ORBIS patch 8 — no layout while hidden: a zero-sized paginator does not re-render. See ORBIS-CHANGES.md.
+    #observer = new ResizeObserver(entries => {
+        if (entries.every(e => !e.contentRect.width || !e.contentRect.height)) return
+        this.render()
+    })
     #top
     #background
     #container
@@ -540,11 +602,25 @@ export class Paginator extends HTMLElement {
             font-size: .75em;
             opacity: .6;
         }
+        /* ORBIS patch 34 — what a view, its frame and its overlay go back to when expand() clears an inline value,
+           and the look of a highlight (Overlayer.highlight), which upstream set inline. */
+        #container > div, #container > div > iframe {
+            width: 100%;
+            height: 100%;
+        }
+        #container > div > svg {
+            top: 0;
+            left: 0;
+        }
+        .foliate-highlight {
+            opacity: var(--overlayer-highlight-opacity, .3);
+            mix-blend-mode: var(--overlayer-highlight-blend-mode, normal);
+        }
         </style>
         <div id="top">
             <div id="background" part="filter"></div>
             <div id="header"></div>
-            <div id="container"></div>
+            <div id="container" part="container"></div>
             <div id="footer"></div>
         </div>
         `
@@ -621,7 +697,7 @@ export class Paginator extends HTMLElement {
 
         this.#mediaQueryListener = () => {
             if (!this.#view) return
-            this.#background.style.background = getBackground(this.#view.document)
+            this.#replaceBackground()
         }
         this.#mediaQuery.addEventListener('change', this.#mediaQueryListener)
     }
@@ -635,6 +711,7 @@ export class Paginator extends HTMLElement {
             case 'max-block-size':
             case 'max-column-count':
                 this.#top.style.setProperty('--_' + name, value)
+                this.render()
                 break
             case 'max-inline-size':
                 // needs explicit `render()` as it doesn't necessarily resize
@@ -650,12 +727,15 @@ export class Paginator extends HTMLElement {
             if (detail.type !== 'text/css') return
             const w = innerWidth
             const h = innerHeight
-            detail.data = Promise.resolve(detail.data).then(data => data
+            // ORBIS patch 5 — a stylesheet that is not a string passes through untouched. See ORBIS-CHANGES.md.
+            detail.data = Promise.resolve(detail.data).then(data => typeof data !== 'string' ? data : data
                 // unprefix as most of the props are (only) supported unprefixed
-                .replace(/(?<=[{\s;])-epub-/gi, '')
+                // ORBIS patch 31 — the character before `-epub-` is matched and put back, not looked behind for.
+                .replace(/([{\s;])-epub-/gi, '$1')
                 // replace vw and vh as they cause problems with layout
-                .replace(/(\d*\.?\d+)vw/gi, (_, d) => parseFloat(d) * w / 100 + 'px')
-                .replace(/(\d*\.?\d+)vh/gi, (_, d) => parseFloat(d) * h / 100 + 'px')
+                // ORBIS patch 26 — patterns that cannot split a run of digits two ways; see VIEWPORT_WIDTH.
+                .replace(VIEWPORT_WIDTH, (_, d) => parseFloat(d) * w / 100 + 'px')
+                .replace(VIEWPORT_HEIGHT, (_, d) => parseFloat(d) * h / 100 + 'px')
                 // `page-break-*` unsupported in columns; replace with `column-break-*`
                 .replace(/page-break-(after|before|inside)\s*:/gi, (_, x) =>
                     `-webkit-column-break-${x}:`)
@@ -668,21 +748,52 @@ export class Paginator extends HTMLElement {
             this.#view.destroy()
             this.#container.removeChild(this.#view.element)
         }
-        this.#view = new View({
+        const view = new View({
             container: this,
             onExpand: () => this.#scrollToAnchor(this.#anchor),
+            onReload: () => { if (view === this.#view) this.#redisplay() },
         })
+        this.#view = view
         this.#container.append(this.#view.element)
         return this.#view
     }
-    #beforeRender({ vertical, rtl, background }) {
+    // ORBIS patch 12 — a frame the browser reloaded is shown again from the start, as a section being turned to is,
+    // at the place it was showing. The anchor is a Range in the discarded document, whose nodes outlive it: its path
+    // there finds the same place in the fresh copy. If that fails, the section's start.
+    async #redisplay() {
+        const index = this.#index
+        if (!this.#canGoToIndex(index)) return
+        const old = this.#anchor
+        let anchor = typeof old === 'number' ? old : 0
+        if (old && typeof old === 'object') {
+            try {
+                let range = old
+                if (old.nodeType === 1) {
+                    range = old.ownerDocument.createRange()
+                    range.selectNode(old)
+                }
+                const parts = parse(fromRange(range))
+                anchor = doc => toRange(doc, parts)
+            } catch {
+                anchor = 0
+            }
+        }
+        this.sections[index]?.unload?.()
+        this.#index = -1
+        await this.#goTo({ index, anchor })
+    }
+    // ORBIS patch 22 — nothing of the book's is painted in Obsidian's window. Upstream copied the chapter's computed
+    // background onto one element per column here, image and all, and a `url()` in it was then fetched from Obsidian's
+    // window, where no book policy applies: one rule in a book's CSS, and opening it told a server so. The layer is
+    // left empty; Orbis paints the reader's theme color behind it, and on the chapter's `<html>` and `<body>`
+    // (`paintPageColor`). See ORBIS-CHANGES.md.
+    #replaceBackground() {
+        this.#background.replaceChildren()
+    }
+    #beforeRender({ vertical, rtl }) {
         this.#vertical = vertical
         this.#rtl = rtl
         this.#top.classList.toggle('vertical', vertical)
-
-        // set background to `doc` background
-        // this is needed because the iframe does not fill the whole element
-        this.#background.style.background = background
 
         const { width, height } = this.#container.getBoundingClientRect()
         const size = vertical ? height : width
@@ -717,7 +828,8 @@ export class Paginator extends HTMLElement {
         if (flow === 'scrolled') {
             // FIXME: vertical-rl only, not -lr
             this.setAttribute('dir', vertical ? 'rtl' : 'ltr')
-            this.#top.style.padding = '0'
+            // ORBIS patch 34 — cleared, not set to 0: the stylesheet gives #top no padding, and nothing else sets one.
+            this.#top.style.removeProperty('padding')
             const columnWidth = maxInlineSize
 
             this.heads = null
@@ -729,8 +841,11 @@ export class Paginator extends HTMLElement {
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
-        const columnWidth = (size / divisor) - gap
+        const columnWidth = vertical ? (size / divisor - margin) : (size / divisor - gap)
         this.setAttribute('dir', rtl ? 'rtl' : 'ltr')
+
+        this.columnCount = divisor
+        this.#replaceBackground()
 
         const marginalDivisor = vertical
             ? Math.min(2, Math.ceil(width / maxInlineSize))
@@ -753,6 +868,9 @@ export class Paginator extends HTMLElement {
     }
     render() {
         if (!this.#view) return
+        // ORBIS patch 13 — no layout at zero size by any route, not only the observer's (patch 8). See ORBIS-CHANGES.md.
+        const { width, height } = this.#container.getBoundingClientRect()
+        if (!width || !height) return
         this.#view.render(this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
@@ -790,17 +908,26 @@ export class Paginator extends HTMLElement {
     get pages() {
         return Math.round(this.viewSize / this.size)
     }
+    // this is the current position of the container
+    get containerPosition() {
+        return this.#container[this.scrollProp]
+    }
+
+    // this is the new position of the containr
+    set containerPosition(newVal) {
+        this.#container[this.scrollProp] = newVal
+    }
+
     scrollBy(dx, dy) {
         const delta = this.#vertical ? dy : dx
-        const element = this.#container
-        const { scrollProp } = this
         const [offset, a, b] = this.#scrollBounds
         const rtl = this.#rtl
         const min = rtl ? offset - b : offset - a
         const max = rtl ? offset + a : offset + b
-        element[scrollProp] = Math.max(min, Math.min(max,
-            element[scrollProp] + delta))
+        this.containerPosition = Math.max(min, Math.min(max,
+            this.containerPosition + delta))
     }
+
     snap(vx, vy) {
         const velocity = this.#vertical ? vy : vx
         const [offset, a, b] = this.#scrollBounds
@@ -837,6 +964,11 @@ export class Paginator extends HTMLElement {
             if (this.#touchScrolled) e.preventDefault()
             return
         }
+        const doc = this.#view?.document
+        const selection = doc?.getSelection()
+        if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+            return
+        }
         e.preventDefault()
         const touch = e.changedTouches[0]
         const x = touch.screenX, y = touch.screenY
@@ -848,7 +980,11 @@ export class Paginator extends HTMLElement {
         state.vx = dx / dt
         state.vy = dy / dt
         this.#touchScrolled = true
-        this.scrollBy(dx, dy)
+        if (Math.abs(dx) >= Math.abs(dy)) {
+            this.scrollBy(dx, 0)
+        } else if (Math.abs(dy) > Math.abs(dx)) {
+            this.scrollBy(0, dy)
+        }
     }
     #onTouchEnd() {
         this.#touchScrolled = false
@@ -886,12 +1022,12 @@ export class Paginator extends HTMLElement {
             return this.#scrollTo(offset, reason)
         }
         const offset = this.#getRectMapper()(rect).left
-        return this.#scrollToPage(Math.floor(offset / this.size) + (this.#rtl ? -1 : 1), reason)
+        // ORBIS patch 2 — scrollToRect rounds to the nearest page. See ORBIS-CHANGES.md.
+        return this.#scrollToPage(Math.floor((offset + 0.5) / this.size) + (this.#rtl ? -1 : 1), reason)
     }
     async #scrollTo(offset, reason, smooth) {
-        const element = this.#container
-        const { scrollProp, size } = this
-        if (element[scrollProp] === offset) {
+        const { size } = this
+        if (this.containerPosition === offset) {
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
             return
@@ -899,14 +1035,14 @@ export class Paginator extends HTMLElement {
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
         if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
-            element[scrollProp], offset, 300, easeOutQuad,
-            x => element[scrollProp] = x,
+            this.containerPosition, offset, 300, easeOutQuad,
+            x => this.containerPosition = x,
         ).then(() => {
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         })
         else {
-            element[scrollProp] = offset
+            this.containerPosition = offset
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         }
@@ -920,7 +1056,8 @@ export class Paginator extends HTMLElement {
     }
     async #scrollToAnchor(anchor, reason = 'anchor') {
         this.#anchor = anchor
-        const rects = uncollapse(anchor)?.getClientRects?.()
+        // ORBIS patch 39 — a range with no boxes is placed by where it starts. See anchorRects and ORBIS-CHANGES.md.
+        const rects = anchorRects(uncollapse(anchor))
         // if anchor is an element or a range
         if (rects) {
             // when the start of the range is immediately after a hyphen in the
@@ -969,7 +1106,7 @@ export class Paginator extends HTMLElement {
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
     async #display(promise) {
-        const { index, src, anchor, onLoad, select } = await promise
+        const { index, src, anchor, onLoad, select, reason } = await promise
         this.#index = index
         const hasFocus = this.#view?.document?.hasFocus()
         if (src) {
@@ -994,15 +1131,17 @@ export class Paginator extends HTMLElement {
             }))
             this.#view = view
         }
-        await this.scrollToAnchor((typeof anchor === 'function'
-            ? anchor(this.#view.document) : anchor) ?? 0, select)
+        // ORBIS patch 19 — a page turn into another file lands as a page turn (`reason`), not as navigation, so the
+        // view's history follows it like any other. See ORBIS-CHANGES.md.
+        const target = (typeof anchor === 'function' ? anchor(this.#view.document) : anchor) ?? 0
+        await (reason ? this.#scrollToAnchor(target, reason) : this.scrollToAnchor(target, select))
         if (hasFocus) this.focusView()
     }
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select}) {
-        if (index === this.#index) await this.#display({ index, anchor, select })
+    async #goTo({ index, anchor, select, reason }) {
+        if (index === this.#index) await this.#display({ index, anchor, select, reason })
         else {
             const oldIndex = this.#index
             const onLoad = detail => {
@@ -1011,7 +1150,7 @@ export class Paginator extends HTMLElement {
                 this.dispatchEvent(new CustomEvent('load', { detail }))
             }
             await this.#display(Promise.resolve(this.sections[index].load())
-                .then(src => ({ index, src, anchor, onLoad, select }))
+                .then(src => ({ index, src, anchor, onLoad, select, reason }))
                 .catch(e => {
                     console.warn(e)
                     console.warn(new Error(`Failed to load section ${index}`))
@@ -1029,7 +1168,7 @@ export class Paginator extends HTMLElement {
         if (this.scrolled) {
             if (this.start > 0) return this.#scrollTo(
                 Math.max(0, this.start - (distance ?? this.size)), null, true)
-            return true
+            return !this.atStart
         }
         if (this.atStart) return
         const page = this.page - 1
@@ -1040,7 +1179,7 @@ export class Paginator extends HTMLElement {
         if (this.scrolled) {
             if (this.viewSize - this.end > 2) return this.#scrollTo(
                 Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
-            return true
+            return !this.atEnd
         }
         if (this.atEnd) return
         const page = this.page + 1
@@ -1065,15 +1204,16 @@ export class Paginator extends HTMLElement {
         if (shouldGo) await this.#goTo({
             index: this.#adjacentIndex(dir),
             anchor: prev ? () => 1 : () => 0,
+            reason: 'page',
         })
         if (shouldGo || !this.hasAttribute('animated')) await wait(100)
         this.#locked = false
     }
-    prev(distance) {
-        return this.#turnPage(-1, distance)
+    async prev(distance) {
+        return await this.#turnPage(-1, distance)
     }
-    next(distance) {
-        return this.#turnPage(1, distance)
+    async next(distance) {
+        return await this.#turnPage(1, distance)
     }
     prevSection() {
         return this.goTo({ index: this.#adjacentIndex(-1) })
@@ -1109,8 +1249,9 @@ export class Paginator extends HTMLElement {
         } else $style.textContent = styles
 
         // NOTE: needs `requestAnimationFrame` in Chromium
-        requestAnimationFrame(() =>
-            this.#background.style.background = getBackground(this.#view.document))
+        requestAnimationFrame(() => {
+            this.#replaceBackground()
+        })
 
         // needed because the resize observer doesn't work in Firefox
         this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
@@ -1127,4 +1268,6 @@ export class Paginator extends HTMLElement {
     }
 }
 
-customElements.define('foliate-paginator', Paginator)
+// ORBIS patch 21: a reload of the plugin reads this file again, and an element cannot be defined twice or
+// unregistered — so the first definition stands until Obsidian restarts. See ORBIS-CHANGES.md.
+if (!customElements.get('foliate-paginator')) customElements.define('foliate-paginator', Paginator)

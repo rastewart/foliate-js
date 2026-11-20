@@ -79,15 +79,17 @@ class FB2Converter {
         this.bins = new Map(Array.from(this.fb2.getElementsByTagName('binary'),
             el => [el.id, el]))
     }
+    // ORBIS patch 20: a picture comes from inside the book or not at all. Upstream returned any href that was not a
+    // `#id` as it stood, so a picture could be an outside URL — loaded with the chapter, and fetched by `getCover`
+    // from Obsidian's own window, where no book CSP applies. An FB2 keeps its pictures in `<binary>` elements.
     getImageSrc(el) {
         const href = el.getAttributeNS(NS.XLINK, 'href')
         if (!href) return 'data:,'
         const [, id] = href.split('#')
-        if (!id) return href
-        const bin = this.bins.get(id)
+        const bin = id ? this.bins.get(id) : null
         return bin
             ? `data:${bin.getAttribute('content-type')};base64,${bin.textContent}`
-            : href
+            : 'data:,'
     }
     image(node) {
         const el = this.doc.createElement('img')
@@ -271,7 +273,8 @@ export const makeFB2 = async blob => {
     }
     if ($('coverpage image')) {
         const src = converter.getImageSrc($('coverpage image'))
-        book.getCover = () => fetch(src).then(res => res.blob())
+        // ORBIS patch 20: no picture in the book is no cover — never a request for `data:,`'s empty one.
+        book.getCover = () => src === 'data:,' ? null : fetch(src).then(res => res.blob())
     } else book.getCover = () => null
 
     // get convert each body
@@ -345,12 +348,13 @@ export const makeFB2 = async blob => {
         const [a, b] = href.split('#')
         return a
             // the link is from the TOC
-            ? { index: Number(a), anchor: doc => doc.querySelector(`[${dataID}="${b}"]`) }
+            // ORBIS patch 30 — escaped: the fragment is the book's, and a quote in it threw from querySelector.
+            ? { index: Number(a), anchor: doc => doc.querySelector(`[${dataID}="${CSS.escape(b ?? '')}"]`) }
             // link from within the page
             : { index: idMap.get(b), anchor: doc => doc.getElementById(b) }
     }
     book.splitTOCHref = href => href?.split('#')?.map(x => Number(x)) ?? []
-    book.getTOCFragment = (doc, id) => doc.querySelector(`[${dataID}="${id}"]`)
+    book.getTOCFragment = (doc, id) => doc.querySelector(`[${dataID}="${CSS.escape(String(id))}"]`) // ORBIS patch 30
     book.isExternal = uri => /^\w+:/i.test(uri)
 
     book.destroy = () => {

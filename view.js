@@ -10,13 +10,6 @@ const isZip = async file => {
     return arr[0] === 0x50 && arr[1] === 0x4b && arr[2] === 0x03 && arr[3] === 0x04
 }
 
-const isPDF = async file => {
-    const arr = new Uint8Array(await file.slice(0, 5).arrayBuffer())
-    return arr[0] === 0x25
-        && arr[1] === 0x50 && arr[2] === 0x44 && arr[3] === 0x46
-        && arr[4] === 0x2d
-}
-
 const isCBZ = ({ name, type }) =>
     type === 'application/vnd.comicbook+zip' || name.endsWith('.cbz')
 
@@ -65,9 +58,53 @@ const makeDirectoryLoader = async entry => {
     return { loadText, loadBlob, getSize }
 }
 
-export class ResponseError extends Error {}
-export class NotFoundError extends Error {}
-export class UnsupportedTypeError extends Error {}
+// ORBIS patch 11 — each open error carries its kind in `name`, which a minified build keeps, and a file recognised
+// as a book format but unreadable inside is a DamagedBookError. See ORBIS-CHANGES.md.
+const namedError = name => class extends Error {
+    constructor(...args) {
+        super(...args)
+        this.name = name
+    }
+}
+export class ResponseError extends namedError('ResponseError') {}
+export class NotFoundError extends namedError('NotFoundError') {}
+export class UnsupportedTypeError extends namedError('UnsupportedTypeError') {}
+export class DamagedBookError extends namedError('DamagedBookError') {}
+
+// ORBIS patch 11 — once the format is known, any failure to read it is the file's.
+const readingDamaged = async read => {
+    try {
+        return await read()
+    } catch (e) {
+        throw new DamagedBookError(e?.message ?? String(e), { cause: e })
+    }
+}
+
+// ORBIS patch 23 — every kind of link a chapter can hold, not only `<a href>`: an image map's `<area>`, an SVG `<a>`
+// written with `xlink:href`, and a MathML element with `href` (WebKit follows those). Upstream listened only for
+// `a[href]`, so a tap on any other went straight to its address in the chapter's frame — no "Open this link?", and
+// on Android an `obsidian://` action ran. See ORBIS-CHANGES.md.
+const XLINK_NS = 'http://www.w3.org/1999/xlink'
+const MATHML_NS = 'http://www.w3.org/1998/Math/MathML'
+const linkAddress = el => el.getAttribute('href') ?? el.getAttributeNS(XLINK_NS, 'href')
+/** The link a click on `target` follows, and its address as written, or null when it follows none. */
+export const findLink = target => {
+    for (let el = target; el && el.nodeType === 1; el = el.parentElement) {
+        const isLink = el.localName === 'a' || el.localName === 'area' || el.namespaceURI === MATHML_NS
+        const href = isLink ? linkAddress(el) : null
+        if (href !== null) return { element: el, href }
+    }
+    return null
+}
+
+// ORBIS patch 27 — a tap inside SVG that `findLink` could not read does nothing. See ORBIS-CHANGES.md.
+const SVG_NS = 'http://www.w3.org/2000/svg'
+/** Whether `target` is in an SVG drawing, or in HTML inside one (`<foreignObject>`). */
+export const insideSvg = target => {
+    for (let el = target; el && el.nodeType === 1; el = el.parentElement)
+        if (el.namespaceURI === SVG_NS) return true
+    return false
+}
 
 const fetchFile = async url => {
     const res = await fetch(url)
@@ -85,74 +122,42 @@ export const makeBook = async file => {
         book = await new EPUB(loader).init()
     }
     else if (!file.size) throw new NotFoundError('File not found')
-    else if (await isZip(file)) {
+    else if (await isZip(file)) book = await readingDamaged(async () => {
         const loader = await makeZipLoader(file)
         if (isCBZ(file)) {
             const { makeComicBook } = await import('./comic-book.js')
-            book = makeComicBook(loader, file)
+            return makeComicBook(loader, file)
         }
         else if (isFBZ(file)) {
             const { makeFB2 } = await import('./fb2.js')
             const { entries } = loader
             const entry = entries.find(entry => entry.filename.endsWith('.fb2'))
             const blob = await loader.loadBlob((entry ?? entries[0]).filename)
-            book = await makeFB2(blob)
+            return await makeFB2(blob)
         }
         else {
             const { EPUB } = await import('./epub.js')
-            book = await new EPUB(loader).init()
+            return await new EPUB(loader).init()
         }
-    }
-    else if (await isPDF(file)) {
-        const { makePDF } = await import('./pdf.js')
-        book = await makePDF(file)
-    }
+    })
     else {
         const { isMOBI, MOBI } = await import('./mobi.js')
-        if (await isMOBI(file)) {
+        if (await isMOBI(file)) book = await readingDamaged(async () => {
             const fflate = await import('./vendor/fflate.js')
-            book = await new MOBI({ unzlib: fflate.unzlibSync }).open(file)
-        }
-        else if (isFB2(file)) {
+            return await new MOBI({ unzlib: fflate.unzlibSync }).open(file)
+        })
+        else if (isFB2(file)) book = await readingDamaged(async () => {
             const { makeFB2 } = await import('./fb2.js')
-            book = await makeFB2(file)
-        }
+            return await makeFB2(file)
+        })
     }
     if (!book) throw new UnsupportedTypeError('File type not supported')
     return book
 }
 
-class CursorAutohider {
-    #timeout
-    #el
-    #check
-    #state
-    constructor(el, check, state = {}) {
-        this.#el = el
-        this.#check = check
-        this.#state = state
-        if (this.#state.hidden) this.hide()
-        this.#el.addEventListener('mousemove', ({ screenX, screenY }) => {
-            // check if it actually moved
-            if (screenX === this.#state.x && screenY === this.#state.y) return
-            this.#state.x = screenX, this.#state.y = screenY
-            this.show()
-            if (this.#timeout) clearTimeout(this.#timeout)
-            if (check()) this.#timeout = setTimeout(this.hide.bind(this), 1000)
-        }, false)
-    }
-    cloneFor(el) {
-        return new CursorAutohider(el, this.#check, this.#state)
-    }
-    hide() {
-        this.#el.style.cursor = 'none'
-        this.#state.hidden = true
-    }
-    show() {
-        this.#el.style.removeProperty('cursor')
-        this.#state.hidden = false
-    }
-}
+// ORBIS patch 35 — upstream's CursorAutohider is removed. It hid the pointer after a second without moving, only with
+// the `autohide-cursor` attribute, which Orbis never sets, and listened to every mouse move over the reader and each
+// chapter to do it. See ORBIS-CHANGES.md.
 
 class History extends EventTarget {
     #arr = []
@@ -218,8 +223,6 @@ export class View extends HTMLElement {
     #searchResults = new Map()
     #searchDraw
     #searchDrawOptions
-    #cursorAutohider = new CursorAutohider(this, () =>
-        this.hasAttribute('autohide-cursor'))
     isFixedLayout = false
     lastLocation
     history = new History()
@@ -258,7 +261,7 @@ export class View extends HTMLElement {
             await import('./paginator.js')
             this.renderer = document.createElement('foliate-paginator')
         }
-        this.renderer.setAttribute('exportparts', 'head,foot,filter')
+        this.renderer.setAttribute('exportparts', 'head,foot,filter,container')
         this.renderer.addEventListener('load', e => this.#onLoad(e.detail))
         this.renderer.addEventListener('relocate', e => this.#onRelocate(e.detail))
         this.renderer.addEventListener('create-overlayer', e =>
@@ -343,7 +346,6 @@ export class View extends HTMLElement {
             doc.documentElement.dir ||= this.language.direction ?? ''
 
         this.#handleLinks(doc, index)
-        this.#cursorAutohider.cloneFor(doc.documentElement)
 
         this.#emit('load', { doc, index })
     }
@@ -351,10 +353,15 @@ export class View extends HTMLElement {
         const { book } = this
         const section = book.sections[index]
         doc.addEventListener('click', e => {
-            const a = e.target.closest('a[href]')
-            if (!a) return
+            // ORBIS patch 23 — any link, not only `a[href]`; see `findLink`.
+            const link = findLink(e.target)
+            // ORBIS patch 27 — the only thing a tap in SVG does by default is follow a link.
+            if (!link) {
+                if (insideSvg(e.target)) e.preventDefault()
+                return
+            }
             e.preventDefault()
-            const href_ = a.getAttribute('href')
+            const { element: a, href: href_ } = link
             const href = section?.resolveHref?.(href_) ?? href_
             if (book?.isExternal?.(href))
                 Promise.resolve(this.#emit('external-link', { a, href_ }, true))
@@ -404,7 +411,7 @@ export class View extends HTMLElement {
             .find(x => x.index === index && x.overlayer)
     }
     #createOverlayer({ doc, index }) {
-        const overlayer = new Overlayer()
+        const overlayer = new Overlayer(doc)
         doc.addEventListener('click', e => {
             const [value, range] = overlayer.hitTest(e)
             if (value && !value.startsWith(SEARCH_PREFIX)) {
@@ -594,4 +601,6 @@ export class View extends HTMLElement {
     }
 }
 
-customElements.define('foliate-view', View)
+// ORBIS patch 21: a reload of the plugin reads this file again, and an element cannot be defined twice or
+// unregistered — so the first definition stands until Obsidian restarts. See ORBIS-CHANGES.md.
+if (!customElements.get('foliate-view')) customElements.define('foliate-view', View)

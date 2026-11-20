@@ -1,8 +1,16 @@
-const unescapeHTML = str => {
+// ORBIS patch 32 — character references decoded by an inert parser, not through `innerHTML`. Upstream set the text as
+// a <textarea>'s HTML and read its value. Here it is parsed as the text of a document's body with each `<` written
+// as `&lt;`, so no element can come of it either, and the result is the same: in both, `&` and NUL are the only
+// other characters that mean anything, and NUL becomes U+FFFD in a textarea but is dropped from a body's text, so it
+// is replaced first. Text with neither, and no CR (which both make a line feed), is returned as it is.
+// See ORBIS-CHANGES.md.
+let textParser
+export const unescapeHTML = str => {
     if (!str) return ''
-    const textarea = document.createElement('textarea')
-    textarea.innerHTML = str
-    return textarea.value
+    if (!str.includes('&') && !str.includes('\r') && !str.includes('\0')) return str
+    textParser ??= new DOMParser()
+    const html = str.replaceAll('<', '&lt;').replaceAll('\0', '�')
+    return textParser.parseFromString(`<!doctype html><body>${html}`, 'text/html').body.textContent ?? ''
 }
 
 const MIME = {
@@ -222,6 +230,8 @@ const countBitsSet = x => {
 
 const countUnsetEnd = x => {
     let count = 0
+    // ORBIS patch 24 — 0, or no mask at all, has no set bit to stop at. See ORBIS-CHANGES.md.
+    if (!x) return count
     while ((x & 1) === 0) x = x >> 1, count++
     return count
 }
@@ -298,8 +308,11 @@ const huffcdic = async (mobi, loadRecord) => {
         }
     }
 
+    // ORBIS patch 29 — the output is gathered and joined once, not copied whole for every code (a 4 KB record took
+    // half a minute), and a record that decompresses past `MAX_HUFF_OUTPUT` is refused.
     const decompress = byteArray => {
-        let output = new Uint8Array()
+        const parts = []
+        let size = 0
         const bitLength = byteArray.byteLength * 8
         for (let i = 0; i < bitLength;) {
             const bits = Number(read32Bits(byteArray, i))
@@ -309,6 +322,8 @@ const huffcdic = async (mobi, loadRecord) => {
                     codeLength += 1
                 value = table2[codeLength][1]
             }
+            // ORBIS patch 24 — a code of no bits would read the same bits for ever, appending to the output each time.
+            if (!(codeLength >= 1)) throw new Error('Invalid HUFF code length')
             if ((i += codeLength) > bitLength) break
 
             const code = value - (bits >>> (32 - codeLength))
@@ -319,12 +334,22 @@ const huffcdic = async (mobi, loadRecord) => {
                 // cache the result for next time
                 dictionary[code] = [result, true]
             }
-            output = concatTypedArray(output, result)
+            parts.push(result)
+            if ((size += result.length) > MAX_HUFF_OUTPUT) throw new Error('HUFF output too large')
+        }
+        const output = new Uint8Array(size)
+        let at = 0
+        for (const part of parts) {
+            output.set(part, at)
+            at += part.length
         }
         return output
     }
     return decompress
 }
+
+// ORBIS patch 29 — far more than a text record ever holds (4 KB), far less than one could be made to claim.
+const MAX_HUFF_OUTPUT = 1 << 20
 
 const getIndexData = async (indxIndex, loadRecord) => {
     const indxRecord = await loadRecord(indxIndex)
@@ -335,7 +360,11 @@ const getIndexData = async (indxIndex, loadRecord) => {
     const tagxBuffer = indxRecord.slice(indx.length)
     const tagx = getStruct(TAGX_HEADER, tagxBuffer)
     if (tagx.magic !== 'TAGX') throw new Error('Invalid TAGX section')
-    const numTags = (tagx.length - 12) / 4
+    // ORBIS patch 24 — no more tags than the record holds. A length past its end gave tags with no mask, and
+    // `countUnsetEnd` never returned.
+    // ORBIS patch 29 — and no more than tags can fill: a tag is one byte, so 256 of them and an end mark for each
+    // control byte. Every entry walks the whole table, so a longer one cost entries × its length.
+    const numTags = Math.min(512, Math.max(0, Math.min(tagx.length - 12, tagxBuffer.byteLength - 12) / 4))
     const tagTable = Array.from({ length: numTags }, (_, i) =>
         new Uint8Array(tagxBuffer.slice(12 + i * 4, 12 + i * 4 + 4)))
 
@@ -361,7 +390,19 @@ const getIndexData = async (indxIndex, loadRecord) => {
         const array = new Uint8Array(record)
         const indx = getStruct(INDX_HEADER, record)
         if (indx.magic !== 'INDX') throw new Error('Invalid INDX record')
-        for (let j = 0; j < indx.numRecords; j++) {
+        // ORBIS patch 29 — no more entries than the record has offsets for: the count is a uint32.
+        const numEntries = Math.min(indx.numRecords, Math.max(0, Math.floor((record.byteLength - indx.idxt - 4) / 2)))
+        // ORBIS patch 29 — the record's values are read once between them. An entry's values lie in its own part of
+        // the record, but nothing made a book's offsets keep to that: entries pointing at one place read the record
+        // from there to its end each, entries × length. Past the budget there is nothing to read, as past the end.
+        let budget = record.byteLength
+        const readVarLen = (array, pos) => {
+            if (budget <= 0) return { value: 0, length: 0 }
+            const read = getVarLen(array, pos)
+            budget -= read.length
+            return read
+        }
+        for (let j = 0; j < numEntries; j++) {
             const offsetOffset = indx.idxt + 4 + 2 * j
             const offset = getUint(record.slice(offsetOffset, offsetOffset + 2))
 
@@ -381,7 +422,7 @@ const getIndexData = async (indxIndex, loadRecord) => {
                 const value = getUint(record.slice(offset, offset + 1)) & mask
                 if (value === mask) {
                     if (countBitsSet(mask) > 1) {
-                        const { value, length } = getVarLen(array, pos)
+                        const { value, length } = readVarLen(array, pos)
                         tags.push([tag, null, value, numValues])
                         pos += length
                     } else tags.push([tag, 1, null, numValues])
@@ -393,14 +434,19 @@ const getIndexData = async (indxIndex, loadRecord) => {
                 const values = []
                 if (valueCount != null) {
                     for (let i = 0; i < valueCount * numValues; i++) {
-                        const { value, length } = getVarLen(array, pos)
+                        const { value, length } = readVarLen(array, pos)
+                        // ORBIS patch 29 — as patch 24 below: past the record's end there is nothing to read, and
+                        // the count is the book's (up to 255 × 255 per tag per entry).
+                        if (!length) break
                         values.push(value)
                         pos += length
                     }
                 } else {
                     let count = 0
                     while (count < valueBytes) {
-                        const { value, length } = getVarLen(array, pos)
+                        const { value, length } = readVarLen(array, pos)
+                        // ORBIS patch 24 — past the record's end there is nothing to read, and the count never grew.
+                        if (!length) break
                         values.push(value)
                         pos += length
                         count += length
@@ -427,9 +473,19 @@ const getNCX = async (indxIndex, loadRecord) => {
         firstChild: tagMap[22]?.[0],
         lastChild: tagMap[23]?.[0],
     }))
+    // ORBIS patch 29 — children found by parent once, not by filtering every entry for each one: 40,000 entries
+    // took seconds. `seen` stops an entry that is its own ancestor.
+    const byParent = new Map()
+    for (const x of items) {
+        if (x.parent == null) continue
+        if (!byParent.has(x.parent)) byParent.set(x.parent, [])
+        byParent.get(x.parent).push(x)
+    }
+    const seen = new Set()
     const getChildren = item => {
-        if (item.firstChild == null) return item
-        item.children = items.filter(x => x.parent === item.index).map(getChildren)
+        if (item.firstChild == null || seen.has(item)) return item
+        seen.add(item)
+        item.children = (byParent.get(item.index) ?? []).map(getChildren)
         return item
     }
     return items.filter(item => item.headingLevel === 0).map(getChildren)
@@ -444,6 +500,9 @@ const getEXTH = (buf, encoding) => {
     for (let i = 0; i < count; i++) {
         const type = getUint(buf.slice(offset, offset + 4))
         const length = getUint(buf.slice(offset + 4, offset + 8))
+        // ORBIS patch 29 — a record shorter than its own header never moves the offset on, and the count is a uint32:
+        // a 386-byte file read the same record millions of times. Stop there, and at the end of the header.
+        if (length < 8 || offset + length > buf.byteLength) break
         if (type in EXTH_RECORD_TYPE) {
             const [name, typ, many] = EXTH_RECORD_TYPE[type]
             const data = buf.slice(offset + 8, offset + length)
@@ -477,6 +536,9 @@ const getFont = async (buf, unzlib) => {
     }
     return array
 }
+
+// ORBIS patches 24 and 29 — for mobi-loops.test.ts, which feeds them crafted records.
+export { getEXTH, getIndexData, huffcdic }
 
 export const isMOBI = async file => {
     const magic = getString(await file.slice(60, 68).arrayBuffer())
@@ -965,7 +1027,9 @@ class KF8 {
             const fdstBuffer = await loadRecord(kf8.fdst)
             const fdst = getStruct(FDST_HEADER, fdstBuffer)
             if (fdst.magic !== 'FDST') throw new Error('Missing FDST record')
-            const fdstTable = Array.from({ length: fdst.numEntries },
+            // ORBIS patch 29 — no more entries than the record holds: the count is a uint32.
+            const fdstTable = Array.from({ length: Math.min(fdst.numEntries,
+                Math.max(0, Math.floor((fdstBuffer.byteLength - 12) / 8))) },
                 (_, i) => 12 + i * 8)
                 .map(offset => [
                     getUint(fdstBuffer.slice(offset, offset + 4)),
@@ -1094,7 +1158,8 @@ class KF8 {
         const newData = await event.detail.data
         const newType = await event.detail.type
         const doc = newType === MIME.SVG ? this.parser.parseFromString(newData, newType) : null
-        return [new Blob([newData], { newType }),
+        // ORBIS patch 7 — the blob keeps its MIME type (upstream writes `{ newType }`). See ORBIS-CHANGES.md.
+        return [new Blob([newData], { type: newType }),
             // SVG wrappers need to be inlined
             // as browsers don't allow external resources when loading SVG as an image
             doc?.getElementsByTagNameNS('http://www.w3.org/2000/svg', 'image')?.length

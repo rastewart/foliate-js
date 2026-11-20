@@ -205,7 +205,28 @@ const getChildNodes = (node, filter) => {
 // regardless of the actual structure in the document;
 // so multiple text nodes need to be combined, and nonexistent ones counted;
 // see "Step Reference to Child Element or Character Data (/)" in EPUB CFI spec
+// ORBIS patch 10 — a scoped cache of indexed children, for many CFIs in one unchanging document. See ORBIS-CHANGES.md.
+let indexCache = null
+export const withIndexCache = fn => {
+    const prev = indexCache
+    indexCache = new WeakMap()
+    try { return fn() } finally { indexCache = prev }
+}
 const indexChildNodes = (node, filter) => {
+    const hit = !filter && indexCache?.get(node)
+    if (hit) return hit
+    const nodes = indexChildNodesUncached(node, filter)
+    if (!filter && indexCache) {
+        const at = new Map()
+        nodes.forEach((x, i) => Array.isArray(x)
+            ? x.forEach(n => at.set(n, i))
+            : x && typeof x === 'object' && at.set(x, i))
+        nodes.orbisIndexOf = at
+        indexCache.set(node, nodes)
+    }
+    return nodes
+}
+const indexChildNodesUncached = (node, filter) => {
     const nodes = getChildNodes(node, filter)
         .reduce((arr, node) => {
             let last = arr[arr.length - 1]
@@ -264,7 +285,8 @@ const nodeToParts = (node, offset, filter) => {
         && filter(parentNode) === NodeFilter.FILTER_SKIP)
         parentNode = parentNode.parentNode
     const indexed = indexChildNodes(parentNode, filter)
-    const index = indexed.findIndex(x =>
+    // ORBIS patch 10 — a cached list carries its own lookup.
+    const index = indexed.orbisIndexOf ? (indexed.orbisIndexOf.get(node) ?? -1) : indexed.findIndex(x =>
         Array.isArray(x) ? x.some(x => x === node) : x === node)
     // adjust offset as if merging the text nodes in the chunk
     const chunk = indexed[index]

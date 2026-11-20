@@ -94,7 +94,9 @@ const childGetter = (doc, ns) => {
 
 const resolveURL = (url, relativeTo) => {
     try {
-        if (relativeTo.includes(':')) return new URL(url, relativeTo)
+        // replace %2c in the url with a comma, this might be introduced by calibre
+        url = url.replace(/%2c/, ',')
+        if (relativeTo.includes(':') && !relativeTo.startsWith('OEBPS')) return new URL(url, relativeTo)
         // the base needs to be a valid URL, so set a base URL and then remove it
         const root = 'https://invalid.invalid/'
         const obj = new URL(url, root + relativeTo)
@@ -121,12 +123,93 @@ const pathDirname = str => str.slice(0, str.lastIndexOf('/') + 1)
 
 // replace asynchronously and sequentially
 // same technique as https://stackoverflow.com/a/48032528
+// ORBIS patch 28 — a `srcset`'s addresses replaced in one pass, as the HTML spec reads a srcset: separators, then
+// an address up to whitespace (less any commas ending it), then descriptors up to the next comma. Upstream's
+// /(\s*)(.+?)\s*((?:\s[\d.]+[wx])+\s*(?:,|$)|,\s+|$)/g retried its lazy address at every start, so a crafted
+// srcset of 64 KB took four seconds on every load of the chapter. Whatever is not an address is kept as it was.
+export const replaceSrcset = async (str, load) => {
+    let out = ''
+    let i = 0
+    const space = c => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f'
+    while (i < str.length) {
+        let j = i
+        while (j < str.length && (space(str[j]) || str[j] === ',')) j++
+        out += str.slice(i, j)
+        i = j
+        if (i >= str.length) break
+        while (j < str.length && !space(str[j])) j++
+        // A run of commas ends the address only at its end: counted back from there, since `/,+$/` tried again from
+        // every comma of a run inside it (64 KB of commas took two seconds)
+        let end = j
+        while (end > i && str[end - 1] === ',') end--
+        const url = str.slice(i, end)
+        const commas = str.slice(end, j)
+        out += (url ? await load(url) : '') + commas
+        i = j
+        if (commas) continue
+        while (j < str.length && str[j] !== ',') j++
+        out += str.slice(i, j)
+        i = j
+    }
+    return out
+}
+
 const replaceSeries = async (str, regex, f) => {
     const matches = []
     str.replace(regex, (...args) => (matches.push(args), null))
     const results = []
     for (const args of matches) results.push(await f(...args))
     return str.replace(regex, () => results.shift())
+}
+
+// ORBIS patch 25 — `url(…)` in CSS found in one pass. Upstream's /url\(\s*["']?([^'"\n]*?)\s*["']?\s*\)/gi has three
+// whitespace runs that can split the same spaces in every way, so a `url(` followed by a few hundred spaces and no `)`
+// took seconds (600: 6 s in V8, 2 s in JavaScriptCore) on every load of the chapter. This finds exactly its matches:
+// that pattern's match always ends at the first `)` after the opening quote, because there the tail
+// `\s*["']?\s*\)` fits with nothing in it. So the address is what lies between, less the longest tail of whitespace,
+// one quote, whitespace; and there is no match if that address holds a quote or a newline. Each character is looked at
+// a bounded number of times. See ORBIS-CHANGES.md.
+const isCSSSpace = c => /\s/.test(c)
+const isQuote = c => c === '"' || c === "'"
+const isQuoteOrNewline = c => c === '"' || c === "'" || c === '\n'
+export const cssURLMatches = str => {
+    const found = []
+    const opener = /url\(/gi
+    let close = -1, tail = 0, lastBad = -1
+    for (let m; (m = opener.exec(str));) {
+        let start = opener.lastIndex
+        while (start < str.length && isCSSSpace(str[start])) start++
+        if (isQuote(str[start])) start++
+        if (close < start) {
+            // every later `url(` lies past the previous `)`, so nothing before it is looked at again
+            const from = close + 1
+            close = str.indexOf(')', start)
+            if (close < 0) break
+            tail = close
+            while (tail > from && isCSSSpace(str[tail - 1])) tail--
+            if (tail > from && isQuote(str[tail - 1])) {
+                tail--
+                while (tail > from && isCSSSpace(str[tail - 1])) tail--
+            }
+            lastBad = tail - 1
+            while (lastBad >= from && !isQuoteOrNewline(str[lastBad])) lastBad--
+        }
+        if (lastBad >= start) continue
+        found.push({ index: m.index, match: str.slice(m.index, close + 1), url: str.slice(start, Math.max(tail, start)) })
+        opener.lastIndex = close + 1
+    }
+    return found
+}
+// Stands in for the regex in `str.replace`, which calls `fn(match, url, offset, string)` for each.
+const CSS_URL = {
+    [Symbol.replace](str, fn) {
+        let out = '', at = 0
+        for (const { index, match, url } of cssURLMatches(str)) {
+            out += str.slice(at, index) + fn(match, url, index, str)
+            at = index + match.length
+        }
+        return out + str.slice(at)
+    },
 }
 
 const regexEscape = str => str.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
@@ -154,8 +237,13 @@ const getPrefixes = doc => {
     const map = new Map(Object.entries(PREFIX))
     const value = doc.documentElement.getAttributeNS(NS.EPUB, 'prefix')
         || doc.documentElement.getAttribute('prefix')
-    if (value) for (const [, prefix, url] of value
-        .matchAll(/(.+): +(.+)[ \t\r\n]*/g)) map.set(prefix, url)
+    // ORBIS patch 28 — read as the spec writes it, `prefix: url` pairs apart by whitespace, instead of
+    // /(.+): +(.+)[ \t\r\n]*/g, which tried every split of the value at every start: 64 KB took two seconds at open.
+    if (value) {
+        const tokens = value.trim().split(/\s+/)
+        for (let i = 0; i + 1 < tokens.length; i++)
+            if (tokens[i].endsWith(':')) map.set(tokens[i].slice(0, -1), tokens[++i])
+    }
     return map
 }
 
@@ -203,7 +291,7 @@ const getMetadata = opf => {
         if (!els) return null
         return Object.groupBy(els.map(parse), x => x.property)
     }
-    const dc = Object.fromEntries(Object.entries(Object.groupBy(els.dc, el => el.localName))
+    const dc = Object.fromEntries(Object.entries(Object.groupBy(els.dc || [], el => el.localName))
         .map(([name, els]) => [name, els.map(parse)]))
     const properties = getProperties() ?? {}
     const legacyMeta = Object.fromEntries(els.legacyMeta?.map(el =>
@@ -582,7 +670,8 @@ const WebCryptoSHA1 = async str => {
 const deobfuscators = (sha1 = WebCryptoSHA1) => ({
     'http://www.idpf.org/2008/embedding': {
         key: opf => sha1(getIdentifier(opf)
-            // eslint-disable-next-line no-control-regex
+            // ORBIS patch 34 — the reason added to upstream's directive.
+            // eslint-disable-next-line no-control-regex -- the key is the identifier less XML's four whitespace characters, as the font obfuscation spec says
             .replaceAll(/[\u0020\u0009\u000d\u000a]/g, '')),
         decode: (key, blob) => deobfuscate(key, 1040, blob),
     },
@@ -671,6 +760,8 @@ class Resources {
             ?? this.getItemByID($$$(opf, 'meta')
                 .find(filterAttribute('name', 'cover'))
                 ?.getAttribute('content'))
+            ?? this.manifest.find(item => item.href.includes('cover')
+                && item.mediaType.startsWith('image'))
             ?? this.getItemByHref(this.guide
                 ?.find(ref => ref.type.includes('cover'))?.href)
 
@@ -765,7 +856,8 @@ class Loader {
         const { href, mediaType } = item
 
         const isScript = MIME.JS.test(item.mediaType)
-        const detail = { type: mediaType, isScript, allow: true}
+        // ORBIS patch 6 — a script item is refused unless a listener allows it. See ORBIS-CHANGES.md.
+        const detail = { type: mediaType, isScript, allow: !isScript }
         const event = new CustomEvent('load', { detail })
         this.eventTarget.dispatchEvent(event)
         const allow = await event.detail.allow
@@ -784,6 +876,8 @@ class Loader {
         return this.createURL(href, tryLoadBlob, mediaType, parent)
     }
     async loadHref(href, base, parents = []) {
+        // ORBIS patch 4 — an empty href resolves to itself instead of throwing. See ORBIS-CHANGES.md.
+        if (!href) return href
         if (isExternal(href)) return href
         const path = resolveURL(href, base)
         const item = this.manifest.find(item => item.href === path)
@@ -826,8 +920,10 @@ class Loader {
                 let child = doc.firstChild
                 while (child instanceof ProcessingInstruction) {
                     if (child.data) {
+                        // ORBIS patch 28 — no leading (?:^|\s*), which rescanned every run of whitespace and
+                        // dropped the space before `href` from the result.
                         const replacedData = await replaceSeries(child.data,
-                            /(?:^|\s*)(href\s*=\s*['"])([^'"]*)(['"])/i,
+                            /\b(href\s*=\s*['"])([^'"]*)(['"])/i,
                             (_, p1, p2, p3) => this.loadHref(p2, href, parents)
                                 .then(p2 => `${p1}${p2}${p3}`))
                         child.replaceWith(doc.createProcessingInstruction(
@@ -847,10 +943,9 @@ class Loader {
                 el.setAttributeNS(NS.XLINK, 'href', await this.loadHref(
                     el.getAttributeNS(NS.XLINK, 'href'), href, parents))
             for (const el of doc.querySelectorAll('[srcset]'))
-                el.setAttribute('srcset', await replaceSeries(el.getAttribute('srcset'),
-                    /(\s*)(.+?)\s*((?:\s[\d.]+[wx])+\s*(?:,|$)|,\s+|$)/g,
-                    (_, p1, p2, p3) => this.loadHref(p2, href, parents)
-                        .then(p2 => `${p1}${p2}${p3}`)))
+                // ORBIS patch 28 — one pass over the candidates, see `replaceSrcset`.
+                el.setAttribute('srcset', await replaceSrcset(el.getAttribute('srcset'),
+                    url => this.loadHref(url, href, parents)))
             // replace inline styles
             for (const el of doc.querySelectorAll('style'))
                 if (el.textContent) el.textContent =
@@ -869,8 +964,8 @@ class Loader {
         return this.createURL(href, result, mediaType, parent)
     }
     async replaceCSS(str, href, parents = []) {
-        const replacedUrls = await replaceSeries(str,
-            /url\(\s*["']?([^'"\n]*?)\s*["']?\s*\)/gi,
+        // ORBIS patch 25 — found in one pass; see `cssURLMatches`.
+        const replacedUrls = await replaceSeries(str, CSS_URL,
             (_, url) => this.loadHref(url, href, parents)
                 .then(url => `url("${url}")`))
         // apart from `url()`, strings can be used for `@import` (but why?!)

@@ -81,6 +81,9 @@ export class SectionProgress {
         const remainingSection = (1 - fractionInSection) * sizeInSection
         return {
             fraction: nextSize / sizeTotal,
+            // ORBIS patch 16 — the fraction at the TOP of the page as well: `fraction` is the page's end. See
+            // ORBIS-CHANGES.md.
+            startFraction: size / sizeTotal,
             section: {
                 current: index,
                 total: sizes.length,

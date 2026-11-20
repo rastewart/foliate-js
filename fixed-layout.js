@@ -1,3 +1,5 @@
+import 'construct-style-sheets-polyfill'
+
 const parseViewport = str => str
     ?.split(/[,;\s]/) // NOTE: technically, only the comma is valid
     ?.filter(x => x)
@@ -30,7 +32,9 @@ const getViewport = (doc, viewport) => {
 }
 
 export class FixedLayout extends HTMLElement {
-    static observedAttributes = ['zoom']
+    // ORBIS patch 38 — `max-column-count`, as the paginator reads it: 1 shows one page at a time. See ORBIS-CHANGES.md.
+    static observedAttributes = ['zoom', 'max-column-count']
+    #onePage = false
     #root = this.attachShadow({ mode: 'closed' })
     #observer = new ResizeObserver(() => this.#render())
     #spreads
@@ -58,12 +62,80 @@ export class FixedLayout extends HTMLElement {
         }`)
 
         this.#observer.observe(this)
+
+        // ORBIS patch 37 — a swipe turns the page. Each page is its own document, so a touch on a page reaches only
+        // that page's listeners: the frames get them as they load, and this element gets them for the margins
+        // around the pages. See ORBIS-CHANGES.md.
+        const opts = { passive: false }
+        const listen = target => {
+            target.addEventListener('touchstart', e => this.#onTouchStart(e), opts)
+            target.addEventListener('touchmove', e => this.#onTouchMove(e), opts)
+            target.addEventListener('touchend', e => this.#onTouchEnd(e))
+            target.addEventListener('touchcancel', () => this.#touch = null)
+        }
+        listen(this)
+        this.addEventListener('load', ({ detail: { doc } }) => listen(doc))
+    }
+    // ORBIS patch 37 — where a one-finger touch began, and when; null once a second finger lands.
+    #touch = null
+    #selecting() {
+        return this.getContents().some(({ doc }) => doc?.getSelection()?.type === 'Range')
+    }
+    // ORBIS patch 37 — how far the page is scrolled sideways, and how far it can be: only a zoomed page scrolls.
+    #scrollRange() {
+        return { at: this.scrollLeft, max: this.scrollWidth - this.clientWidth }
+    }
+    #onTouchStart(e) {
+        const touch = e.changedTouches[0]
+        this.#touch = e.touches.length > 1 || !touch ? null
+            : { x: touch.screenX, y: touch.screenY, t: e.timeStamp, at: this.#scrollRange().at }
+    }
+    #onTouchMove(e) {
+        if (e.touches.length > 1) this.#touch = null
+        if (!this.#touch || this.#selecting() || globalThis.visualViewport?.scale > 1) return
+        // As the paginator does: the drag is the page's to turn, not the browser's to scroll or bounce. A zoomed
+        // page still pans.
+        if (this.#scrollRange().max <= 1) e.preventDefault()
+    }
+    #onTouchEnd(e) {
+        const start = this.#touch
+        this.#touch = null
+        const touch = e.changedTouches[0]
+        if (!start || !touch || this.#selecting() || globalThis.visualViewport?.scale > 1) return
+        const dx = touch.screenX - start.x
+        const dy = touch.screenY - start.y
+        if (Math.abs(dx) <= Math.abs(dy)) return
+        // Far enough, or a quick flick: the paginator turns on a flick of a few pixels too.
+        const speed = Math.abs(dx) / Math.max(1, e.timeStamp - start.t)
+        if (Math.abs(dx) < 40 && (Math.abs(dx) < 10 || speed < 0.3)) return
+        // A zoomed page turns only from the edge it was already at when the swipe began; before that, a swipe pans.
+        const { max } = this.#scrollRange()
+        if (max > 1 && (dx < 0 ? start.at < max - 1 : start.at > 1)) return
+        // The swipe that turned the page is not also a tap: a flick of a few pixels can still end in a click, which
+        // would open the picture in Orbis's image viewer, or turn the page again at its edge.
+        this.#swallowClick(e.currentTarget)
+        // The finger moving left brings in what is to the right: the next page left to right, the previous one in
+        // a right-to-left book.
+        if (dx < 0) this.rtl ? this.prev() : this.next()
+        else this.rtl ? this.next() : this.prev()
+    }
+    #swallowClick(target) {
+        const swallow = e => {
+            e.preventDefault()
+            e.stopImmediatePropagation()
+        }
+        target.addEventListener('click', swallow, { capture: true, once: true })
+        setTimeout(() => target.removeEventListener('click', swallow, { capture: true }), 500)
     }
     attributeChangedCallback(name, _, value) {
         switch (name) {
             case 'zoom':
                 this.#zoom = value !== 'fit-width' && value !== 'fit-page'
                     ? parseFloat(value) : value
+                this.#render()
+                break
+            case 'max-column-count':
+                this.#onePage = parseInt(value) === 1
                 this.#render()
                 break
         }
@@ -81,11 +153,13 @@ export class FixedLayout extends HTMLElement {
             display: 'none',
             overflow: 'hidden',
         })
+        // ORBIS patch 17 — `part` before `sandbox`, as paginator.js has it: the desktop sandbox patch knows a book
+        // frame by its `part`. See ORBIS-CHANGES.md.
+        iframe.setAttribute('part', 'filter')
         // `allow-scripts` is needed for events because of WebKit bug
         // https://bugs.webkit.org/show_bug.cgi?id=218086
         iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         iframe.setAttribute('scrolling', 'no')
-        iframe.setAttribute('part', 'filter')
         this.#root.append(element)
         if (!src) return { blank: true, element, iframe }
         return new Promise(resolve => {
@@ -109,8 +183,10 @@ export class FixedLayout extends HTMLElement {
         const right = this.#center ?? this.#right ?? {}
         const target = side === 'left' ? left : right
         const { width, height } = this.getBoundingClientRect()
-        const portrait = this.spread !== 'both' && this.spread !== 'portrait'
-            && height > width
+        // ORBIS patch 38 — one page at a time when the reader asks for one column, whatever the pane's shape and
+        // whatever the book says about spreads. Upstream showed a spread whenever the pane was wider than tall.
+        const portrait = this.#onePage
+            || this.spread !== 'both' && this.spread !== 'portrait' && height > width
         this.#portrait = portrait
         const blankWidth = left.width ?? right.width ?? 0
         const blankHeight = left.height ?? right.height ?? 0
@@ -144,17 +220,16 @@ export class FixedLayout extends HTMLElement {
                 transformOrigin: 'top left',
                 display: blank ? 'none' : 'block',
             })
+            // ORBIS patch 34 — the page of a spread that portrait does not show is hidden in the same assignment that
+            // shows the others, as the frame's display is above, not set to `block` and then to `none`.
             Object.assign(element.style, {
                 width: `${(width ?? blankWidth) * scale}px`,
                 height: `${(height ?? blankHeight) * scale}px`,
                 overflow: 'hidden',
-                display: 'block',
+                display: portrait && frame !== target ? 'none' : 'block',
                 flexShrink: '0',
                 marginBlock: 'auto',
             })
-            if (portrait && frame !== target) {
-                element.style.display = 'none'
-            }
         }
         if (this.#center) {
             transform(this.#center)
@@ -316,4 +391,6 @@ export class FixedLayout extends HTMLElement {
     }
 }
 
-customElements.define('foliate-fxl', FixedLayout)
+// ORBIS patch 21: a reload of the plugin reads this file again, and an element cannot be defined twice or
+// unregistered — so the first definition stands until Obsidian restarts. See ORBIS-CHANGES.md.
+if (!customElements.get('foliate-fxl')) customElements.define('foliate-fxl', FixedLayout)
