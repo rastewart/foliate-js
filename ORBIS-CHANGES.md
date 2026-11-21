@@ -1,13 +1,14 @@
 # foliate-js in Orbis Reader
 
-> **This branch is Orbis Reader's fork of foliate-js**, made from the copy that was vendored in Orbis's
-> `src/vendor/foliate-js` up to Orbis 0.1.3. It is upstream `78914ae` plus the patches below. Orbis depends on this
-> branch at a pinned commit. The history below is from when the files lived in Orbis's repository.
+This is Orbis Reader's fork of [foliate-js](https://github.com/johnfactotum/foliate-js) by John Factotum, MIT
+licensed (`LICENSE`). Its `orbis` branch is upstream plus Orbis's changes, and every way it differs from upstream is
+listed here. Orbis depends on it at a pinned commit, `"foliate-js": "github:rastewart/foliate-js#<commit>"` in
+Orbis's `package.json`, and imports it as `foliate-js/…`.
 
-This folder is [foliate-js](https://github.com/johnfactotum/foliate-js) by John Factotum, MIT licensed (`LICENSE`),
-vendored into Orbis Reader on 2026-09-25. Every way it differs from upstream is listed here. Orbis imports it as
-`foliate-js/…` through `"foliate-js": "link:./src/vendor/foliate-js"` in the root `package.json`, so the imports read
-as they did when it came from npm.
+**From 2026-09-25 to Orbis 0.1.3 these files were vendored in Orbis's repository**, in `src/vendor/foliate-js`. They
+moved here unchanged on 2026-11-20, so that upstream can be merged with git, and so that the Community directory's
+scan of Orbis's repository covers Orbis's own code rather than counting foliate's. Where the history below says
+"this folder", it means those files, now this branch.
 
 ## Where it came from
 
@@ -40,12 +41,14 @@ them. Their SHA-256s, to check a copy against or to tell whether a merge changed
 
 **Kept:** the files `view.js` reaches (`comic-book`, `epub`, `epubcfi`, `fb2`, `fixed-layout`, `mobi`, `overlayer`,
 `paginator`, `progress`, `search`, `text-walker`, `tts`, `view`, and `vendor/fflate`, `vendor/zip`). That set imports
-nothing outside itself except `construct-style-sheets-polyfill` (from `fixed-layout.js`), which is therefore a direct
-dependency in the root `package.json`.
+nothing outside itself except `construct-style-sheets-polyfill` (from `fixed-layout.js`), which is therefore a
+dependency in this branch's `package.json`, and pinned to the same version in Orbis's.
 
-**Left out**, since Orbis never loads them: `dict.js`, `footnotes.js`, `opds.js`, `quote-image.js`, `uri-template.js`,
-`reader.js`, `reader.html`, `ui/`, `tests/`, `rollup/` and the build configs. Upstream's `pdf.js` and `vendor/pdfjs/`
-were already gone from the npm package, and `view.js` has PDF detection removed to match. Orbis opens no PDFs.
+**Not used**, since Orbis never loads them: `dict.js`, `footnotes.js`, `opds.js`, `quote-image.js`, `uri-template.js`,
+`reader.js`, `reader.html`, `ui/`, `tests/`, `rollup/` and the build configs. While the files were vendored these were
+left out. This branch keeps them as upstream has them, so a merge has nothing extra to resolve, and Orbis's build
+bundles only what `view.js` reaches. The same goes for upstream's `pdf.js` and `vendor/pdfjs/`: `view.js` has PDF
+detection removed, and Orbis opens no PDFs.
 
 ## The npm publisher's changes, against `052123b`
 
@@ -611,10 +614,11 @@ Obsidian rather than foliate:
 
 ## Taking changes from upstream
 
-This folder is merged through `78914ae`. To take later changes:
+This branch is merged through `78914ae`. To take later changes:
 
-1. For each kept file, merge three ways: the base is upstream at the "merged through" commit, "ours" is this folder,
-   "theirs" is upstream at the commit you want (`git merge-file ours base theirs`).
+1. Merge upstream into `orbis`: `git fetch upstream` (`https://github.com/johnfactotum/foliate-js`), then
+   `git merge upstream/main`. Git merges each file three ways from the "merged through" commit, which is what was
+   done by hand while the files were vendored.
 2. Keep every row marked **Relies on it** above and every `// ORBIS patch` edit.
 3. **Read what each commit changes, not just whether it merged.** The last merge merged all but one file without
    overlap, and still reversed the script default (patch 6) and brought in an untyped blob (patch 7). Check new
@@ -623,3 +627,5 @@ This folder is merged through `78914ae`. To take later changes:
 4. Update "merged through" at the top of this file, and add rows for anything new.
 5. Test with a Calibre book, a MOBI/AZW3, an FB2 and a CBZ, not just an EPUB from Gutenberg: the patches above were
    each found on one of those.
+6. Push `orbis`. In Orbis, move the pinned commit in `package.json` to the merge and run `pnpm install`, then follow
+   "Before taking changes from upstream foliate-js" in Orbis's `docs/design/dependency-security.md`.
