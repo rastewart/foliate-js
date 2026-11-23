@@ -1087,6 +1087,8 @@ export class Paginator extends HTMLElement {
             this.start - size, this.end - size, this.#getRectMapper())
     }
     #afterScroll(reason) {
+        // ORBIS patch 40 — no position while the frame's document has no body yet. See ORBIS-CHANGES.md.
+        if (!this.#view?.document?.body) return
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor

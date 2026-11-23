@@ -92,7 +92,7 @@ patches 6 and 7 say so.
 
 Patches 1 to 5 used to be string replacements applied at build time by a plugin in `esbuild.config.mjs`. They are
 ordinary edits now, each marked in the source with `// ORBIS patch N`. What follows is the plugin's own explanation,
-moved here unchanged. Patches 6 and 7 came with the upstream merge and follow after it; patches 8 to 39 after them.
+moved here unchanged. Patches 6 and 7 came with the upstream merge and follow after it; patches 8 to 40 after them.
 
 Five patches to Foliate. The first two fix mobile annotation navigation landing one page short of the target;
 the third stops the column gutter taking its size from the side-margin setting; the last two keep one bad
@@ -600,6 +600,16 @@ where it was, the cover shifted by the difference, until a page turn gave the pa
 now places a range with no boxes by the element it starts at, or, when that is not an element, by the element it starts
 in. `paginator-anchor-rects.test.ts` checks it.
 
+### Patch 40
+
+**No position is reported while the frame's document has no body** (paginator.js). The paginator's `ResizeObserver`
+re-renders, and the render scrolls back to its anchor and reports where it landed through `#afterScroll`, which asks
+`getVisibleRange` for the visible text by walking `doc.body`. While a frame swaps in a chapter, its document can have
+a root element and no body yet. Patch 18 lets the render through once the root exists, and a resize at that instant
+reached `createTreeWalker` with a null body, which threw (`parameter 1 is not of type 'Node'`). Orbis logged it as an
+unhandled rejection, and the reader was unaffected. `#afterScroll` now returns while there is no body, and the
+chapter's own load reports the position once the body exists. Orbis's end-to-end tests met it in about one run in
+three when books opened one after another, and not once in 12 runs with the patch.
 ## Patched at runtime, not here
 
 Three other files change foliate's behavior while the app runs. They stay where they are, because they are about
