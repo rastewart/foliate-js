@@ -92,7 +92,7 @@ patches 6 and 7 say so.
 
 Patches 1 to 5 used to be string replacements applied at build time by a plugin in `esbuild.config.mjs`. They are
 ordinary edits now, each marked in the source with `// ORBIS patch N`. What follows is the plugin's own explanation,
-moved here unchanged. Patches 6 and 7 came with the upstream merge and follow after it; patches 8 to 40 after them.
+moved here unchanged. Patches 6 and 7 came with the upstream merge and follow after it; patches 8 to 42 after them.
 
 Five patches to Foliate. The first two fix mobile annotation navigation landing one page short of the target;
 the third stops the column gutter taking its size from the side-margin setting; the last two keep one bad
@@ -610,6 +610,26 @@ reached `createTreeWalker` with a null body, which threw (`parameter 1 is not of
 unhandled rejection, and the reader was unaffected. `#afterScroll` now returns while there is no body, and the
 chapter's own load reports the position once the body exists. Orbis's end-to-end tests met it in about one run in
 three when books opened one after another, and not once in 12 runs with the patch.
+
+### Patch 41
+
+**A frame whose document has no body yet stops observing nothing** (paginator.js). The frame's `View.destroy`
+checked that it had a document and then passed `document.body` to `ResizeObserver.unobserve`. A book closed while a
+chapter was still loading destroys a frame whose document has no body, and `unobserve(null)` threw
+(`parameter 1 is not of type 'Element'`). Nothing was observed until the body existed, so there is nothing to stop,
+and `destroy` now unobserves only a body. The same moment as patch 40, met from the other side.
+
+### Patch 42
+
+**No position is reported while the paginator has no section** (paginator.js). The paginator's section index is -1
+while `#redisplay` reloads a frame, and undefined after a chapter fails to load, which happens when a book closes
+mid-load. A resize in that window, such as the tab closing, still reached `#afterScroll` through the old frame's
+`ResizeObserver` and reported a place in that index. The view's `getCFI` then read `book.sections[index].cfi` and
+threw (`Cannot read properties of undefined (reading 'cfi')`). Orbis logged it, and the reader was unaffected.
+`#afterScroll` now returns unless the index names a section, and the next load reports the position. Orbis's
+end-to-end tests that delete a book and its reading data met it in 9 of 12 runs on Windows, and in none of 12 with the
+patch.
+
 ## Patched at runtime, not here
 
 Three other files change foliate's behavior while the app runs. They stay where they are, because they are about

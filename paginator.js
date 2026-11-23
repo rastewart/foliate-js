@@ -474,7 +474,8 @@ class View {
         return this.#overlayer
     }
     destroy() {
-        if (this.document) this.#observer.unobserve(this.document.body)
+        // ORBIS patch 41 — a document with no body yet has nothing observed. See ORBIS-CHANGES.md.
+        if (this.document?.body) this.#observer.unobserve(this.document.body)
     }
 }
 
@@ -1089,6 +1090,8 @@ export class Paginator extends HTMLElement {
     #afterScroll(reason) {
         // ORBIS patch 40 — no position while the frame's document has no body yet. See ORBIS-CHANGES.md.
         if (!this.#view?.document?.body) return
+        // ORBIS patch 42 — no position while the paginator has no section to report it in. See ORBIS-CHANGES.md.
+        if (!this.#canGoToIndex(this.#index)) return
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
