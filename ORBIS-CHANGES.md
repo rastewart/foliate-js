@@ -630,6 +630,14 @@ threw (`Cannot read properties of undefined (reading 'cfi')`). Orbis logged it, 
 end-to-end tests that delete a book and its reading data met it in 9 of 12 runs on Windows, and in none of 12 with the
 patch.
 
+### Patch 43
+
+**A page turn into another section does not slide onto the empty page first** (paginator.js). A paginated section has
+an empty page at each end, and a turn past its last or first text page scrolls onto that page before the next section
+loads. Without the `animated` attribute the page is there for a frame or two. With it, the paginator slid to it over
+300ms, so a reader with Orbis's Page turn on Slide saw a blank page at the end of every chapter. `#scrollToPage` now
+jumps to an empty page, for a key, a button and a swipe alike, and the next section shows as soon as it loads.
+
 ## Patched at runtime, not here
 
 Three other files change foliate's behavior while the app runs. They stay where they are, because they are about

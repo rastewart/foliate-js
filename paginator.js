@@ -1026,7 +1026,7 @@ export class Paginator extends HTMLElement {
         // ORBIS patch 2 — scrollToRect rounds to the nearest page. See ORBIS-CHANGES.md.
         return this.#scrollToPage(Math.floor((offset + 0.5) / this.size) + (this.#rtl ? -1 : 1), reason)
     }
-    async #scrollTo(offset, reason, smooth) {
+    async #scrollTo(offset, reason, smooth, jump) {
         const { size } = this
         if (this.containerPosition === offset) {
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
@@ -1035,7 +1035,7 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
+        if (!jump && (reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
             this.containerPosition, offset, 300, easeOutQuad,
             x => this.containerPosition = x,
         ).then(() => {
@@ -1050,7 +1050,9 @@ export class Paginator extends HTMLElement {
     }
     async #scrollToPage(page, reason, smooth) {
         const offset = this.size * (this.#rtl ? -page : page)
-        return this.#scrollTo(offset, reason, smooth)
+        // ORBIS patch 43 — no slide onto the empty page at either end of a section. See ORBIS-CHANGES.md.
+        const jump = page <= 0 || page >= this.pages - 1
+        return this.#scrollTo(offset, reason, smooth, jump)
     }
     async scrollToAnchor(anchor, select) {
         return this.#scrollToAnchor(anchor, select ? 'selection' : 'navigation')
