@@ -774,7 +774,15 @@ export class Paginator extends HTMLElement {
                     range.selectNode(old)
                 }
                 const parts = parse(fromRange(range))
-                anchor = doc => toRange(doc, parts)
+                // ORBIS patch 44 — the path is looked up in the fresh copy later, in `#display`, outside this `try`.
+                // A path that does not fit it threw there, rather than giving the section's start as promised above.
+                anchor = doc => {
+                    try {
+                        return toRange(doc, parts)
+                    } catch {
+                        return 0
+                    }
+                }
             } catch {
                 anchor = 0
             }

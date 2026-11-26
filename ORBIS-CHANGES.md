@@ -92,7 +92,7 @@ patches 6 and 7 say so.
 
 Patches 1 to 5 used to be string replacements applied at build time by a plugin in `esbuild.config.mjs`. They are
 ordinary edits now, each marked in the source with `// ORBIS patch N`. What follows is the plugin's own explanation,
-moved here unchanged. Patches 6 and 7 came with the upstream merge and follow after it; patches 8 to 42 after them.
+moved here unchanged. Patches 6 and 7 came with the upstream merge and follow after it; patches 8 to 44 after them.
 
 Five patches to Foliate. The first two fix mobile annotation navigation landing one page short of the target;
 the third stops the column gutter taking its size from the side-margin setting; the last two keep one bad
@@ -637,6 +637,17 @@ an empty page at each end, and a turn past its last or first text page scrolls o
 loads. Without the `animated` attribute the page is there for a frame or two. With it, the paginator slid to it over
 300ms, so a reader with Orbis's Page turn on Slide saw a blank page at the end of every chapter. `#scrollToPage` now
 jumps to an empty page, for a key, a button and a swipe alike, and the next section shows as soon as it loads.
+
+### Patch 44
+
+**A reloaded frame whose place does not fit the fresh copy shows the section's start** (paginator.js), as patch 12
+says it does. `#redisplay` carries the place as a CFI path and makes the anchor a function of the new document, but
+its `try` covered only reading the path from the old Range. The function runs later, in `#display`, and `toRange`
+threw there when the path did not fit the fresh copy: one leading into an element the copy has empty lists no
+children and reads the first (`Cannot destructure property 'nodeType' of 'undefined'`). Orbis logged it as an unhandled
+rejection, and `reloaded-frame-anchor.test.ts` reproduces the throw. The function now returns 0, the section's
+start, when `toRange` throws. Met once in a full run of Orbis's end-to-end tests on macOS, in *the reading data folder
+mends itself*, and recorded there as a known issue until this.
 
 ## Patched at runtime, not here
 
